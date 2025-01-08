@@ -62,6 +62,9 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         dk = tf.cast(sqrt_att_head_size, tf.float32)
         attention_scores = tf.divide(attention_scores, dk)
 
+        if mask is not None:
+            attention_scores = tf.add(attention_scores, mask)
+
         attention_probs = self.stable_softmax(attention_scores, axis=-1)
         attention_probs = self.dropout(attention_probs, training=training)
 

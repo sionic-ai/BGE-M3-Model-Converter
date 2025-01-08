@@ -24,8 +24,8 @@ def tokenize_wo_padding(tokenizer, text, return_tensors="pt"):
     return tokenizer(text, padding=False, return_tensors=return_tensors)
 
 
-def tokenize_w_padding(tokenizer, text, return_tensors="pt"):
-    return tokenizer(text, padding="max_length", max_length=512, return_tensors=return_tensors)
+def tokenize_w_padding(tokenizer, text, return_tensors="pt", max_length=512):
+    return tokenizer(text, padding="max_length", max_length=max_length, return_tensors=return_tensors)
 
 
 def main():
@@ -61,21 +61,34 @@ def main():
     
     inputs_tf = tokenize_wo_padding(tokenizer, text, return_tensors="tf")
     inputs_tf_w_padding = tokenize_w_padding(tokenizer, text, return_tensors="tf")
+    inputs_tf_w_padding_attnFixed = inputs_tf_w_padding.copy()
+    inputs_tf_w_padding_attnFixed['attention_mask'] = tf.where(inputs_tf_w_padding['attention_mask'] == 0, -9999999, 0)
     tf_model = load_tf_model(model_path_tf).signatures["serving_default"]
 
     loguru.logger.info("Tensorflow] Model output".ljust(50, "-"))
     with tf.device("/GPU:0"):
         output_tf = tf_model(**inputs_tf)
         output_tf_w_padding = tf_model(**inputs_tf_w_padding)
+        output_tf_w_padding_attnFixed = tf_model(**inputs_tf_w_padding_attnFixed)
         loguru.logger.info("output without padding (GT)".ljust(50, "-"))
         loguru.logger.info(output_tf['hidden_states'][-1][:,0])
         loguru.logger.info("="*50)
         loguru.logger.info("output with padding".ljust(50, "-"))
         loguru.logger.info(output_tf_w_padding['hidden_states'][-1][:,0])
         loguru.logger.info("="*50)
+        loguru.logger.info("output with padding (attention fixed)".ljust(50, "-"))
+        loguru.logger.info(output_tf_w_padding_attnFixed['hidden_states'][-1][:,0])
+        loguru.logger.info("="*50)
         err_tf = tf.abs(output_tf['hidden_states'][-1][:,0] - output_tf_w_padding['hidden_states'][-1][:,0])
         loguru.logger.info("Error".ljust(50, "-"))
         loguru.logger.info(tf.reduce_mean(err_tf))
+        loguru.logger.info("="*50)
+        err_tf_attnFixed = tf.abs(output_tf_w_padding['hidden_states'][-1][:,0] - output_tf_w_padding_attnFixed['hidden_states'][-1][:,0])
+        loguru.logger.info("Error (attention fixed)".ljust(50, "-"))
+        loguru.logger.info(tf.reduce_mean(err_tf_attnFixed))
+        loguru.logger.info("="*50)
+        
+
 
 if __name__ == "__main__":
     main()
