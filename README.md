@@ -43,9 +43,10 @@ git clone https://huggingface.co/BAAI/bge-m3
 
 3. Set up Python virtual environment:
 ```bash
-python3.11 -m venv venv
+uv sync
+//python3.11 -m venv venv
 source ./venv/bin/activate
-pip install -r requirements.txt
+uv add -r requirements.txt
 ```
 
 ## Usage
