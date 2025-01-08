@@ -261,11 +261,11 @@ def compare_layer_outputs1(pt_all_layer_outputs, tf_all_layer_outputs):
 
 def main():
     # 경로 설정 (예: ./bge-m3, ./converted_bge_m3)
-    model_name_or_path = "./bge-m3"  # PyTorch 원본
+    model_name_or_path = "BAAI/bge-m3"  # PyTorch 원본
     saved_model_dir = "./converted_bge_m3"  # TF 변환본
 
     queries = [
-        "이 모델은 무엇을 하는 모델인가요?",
+        "이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?",
         "이 모델은 무엇을 하는 모델인가요?"
     ]
 

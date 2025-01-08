@@ -43,21 +43,22 @@ git clone https://huggingface.co/BAAI/bge-m3
 
 3. Set up Python virtual environment:
 ```bash
-python3.11 -m venv venv
+uv venv
 source ./venv/bin/activate
-pip install -r requirements.txt
+uv sync
+# uv add -r requirements.txt
 ```
 
 ## Usage
 
 1. Convert the model weights:
 ```bash
-python BGEM3WeightConverter.py
+uv run BGEM3WeightConverter.py
 ```
 
 2. Validate the converted model:
 ```bash
-python model_conversion_validator.py
+uv run model_conversion_validator.py
 ```
 
 ## Model Architecture
