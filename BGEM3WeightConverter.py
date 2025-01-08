@@ -1,4 +1,5 @@
 from BGEM3TFModel import BGEM3TensorFlow, save_model_with_tokenizer
+from huggingface_hub import hf_hub_download
 
 from transformers import AutoModel
 import numpy as np
@@ -19,13 +20,33 @@ def load_sparse_weights():
 
 
 def load_colbert_weights():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(script_dir, './bge-m3', 'colbert_linear.pt')
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"FileNotFoundError: {model_path}")
+    repo_id = "BAAI/bge-m3"
+    filename = "colbert_linear.pt"
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    return torch.load(model_path, map_location=device, weights_only=True)
+
+    try:
+        hf_model_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+        )
+        print(f"Loaded from Hugging Face: {hf_model_path}")
+
+        model = torch.load(hf_model_path, map_location=device)
+
+    except Exception as e:
+        print("Failed to load from Hugging Face. Reason:", e)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_model_path = os.path.join(script_dir, 'bge-m3', 'colbert_linear.pt')
+
+        if not os.path.exists(local_model_path):
+            raise FileNotFoundError(f"FileNotFoundError: {local_model_path}")
+
+        print(f"Loaded from local: {local_model_path}")
+        model = torch.load(local_model_path, map_location=device)
+
+    return model
 
 
 def _init_colbert_weights(tf_model):
