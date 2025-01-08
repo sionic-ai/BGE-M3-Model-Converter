@@ -225,7 +225,7 @@ def convert_and_save_model(model_name: str, save_path: str):
 
 
 if __name__ == "__main__":
-    model_name = "./bge-m3"
+    model_name = "BAAI/bge-m3"
     save_path = "./converted_bge_m3"
 
     tf_model = convert_and_save_model(model_name, save_path)
