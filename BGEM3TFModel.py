@@ -351,7 +351,13 @@ class TransformerBlock(tf.keras.layers.Layer):
 
 
 def save_model_with_tokenizer(model, tokenizer, save_path):
-    """Save both model and tokenizer"""
+    """Save both model and tokenizer.
+
+    Changes:
+    - Serving signature now accepts int64 (int64) for input_ids and attention_mask
+      to be compatible with TF-Java callers that send int64. We cast to int32 internally.
+    - Adds 'last_hidden_state' to outputs alongside 'dense_vecs', 'colbert_vecs', and 'hidden_states'.
+    """
     os.makedirs(save_path, exist_ok=True)
     model_save_path = os.path.join(save_path, 'model')
 
@@ -364,30 +370,32 @@ def save_model_with_tokenizer(model, tokenizer, save_path):
 
     # Define serving signature
     @tf.function(input_signature=[
-        tf.TensorSpec(shape=[None, None], dtype=tf.int32, name='input_ids'),
-        tf.TensorSpec(shape=[None, None], dtype=tf.int32, name='attention_mask')
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='input_ids'),
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='attention_mask')
     ])
     def serving_fn(input_ids, attention_mask):
+        # Cast int64 -> int32 for internal computation compatibility
+        input_ids_i32 = tf.cast(input_ids, tf.int32)
+        attention_mask_i32 = tf.cast(attention_mask, tf.int32)
 
-        print(input_ids)
         inputs = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask
+            'input_ids': input_ids_i32,
+            'attention_mask': attention_mask_i32
         }
 
         outputs = model(inputs=inputs, training=False, output_hidden_states=True)
 
-        if outputs.get('hidden_states'):
+        result = {
+            'dense_vecs': outputs['dense_vecs'],
+            'colbert_vecs': outputs['colbert_vecs'],
+            'last_hidden_state': outputs['last_hidden_state'],
+        }
+
+        if outputs.get('hidden_states') is not None:
             hidden_states = tf.stack(outputs['hidden_states'], axis=0)
-            return {
-                'dense_vecs': outputs['dense_vecs'],  # CLS Token
-                'colbert_vecs': outputs['colbert_vecs'],
-                'hidden_states': hidden_states  # (num_layers, batch, seq_len, hidden_dim)
-            }
-        else:
-            return {
-                'dense_vecs': outputs['dense_vecs'],
-            }
+            result['hidden_states'] = hidden_states
+
+        return result
 
     # Save model
     tf.saved_model.save(
@@ -397,6 +405,70 @@ def save_model_with_tokenizer(model, tokenizer, save_path):
     )
 
     # Save tokenizer
+    tokenizer.save_pretrained(save_path)
+
+    return model_save_path
+
+
+def save_model_with_tokenizer_frozen(model, tokenizer, save_path):
+    """Save a Frozen SavedModel (variables converted to constants) and tokenizer.
+
+    - Accepts int64 inputs for TF-Java/Kotlin compatibility, casts to int32 internally.
+    - Outputs: dense_vecs, colbert_vecs, last_hidden_state, hidden_states.
+    - Produces a SavedModel with no variables directory (weights baked as constants).
+    """
+    from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2
+
+    os.makedirs(save_path, exist_ok=True)
+    model_save_path = os.path.join(save_path, 'model')
+
+    # Ensure model is built
+    dummy_inputs = {
+        'input_ids': tf.zeros((2, 11), dtype=tf.int32),
+        'attention_mask': tf.ones((2, 11), dtype=tf.int32)
+    }
+    _ = model(dummy_inputs, training=False, output_hidden_states=True)
+
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='input_ids'),
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='attention_mask')
+    ])
+    def serving_fn(input_ids, attention_mask):
+        input_ids_i32 = tf.cast(input_ids, tf.int32)
+        attention_mask_i32 = tf.cast(attention_mask, tf.int32)
+
+        inputs = {
+            'input_ids': input_ids_i32,
+            'attention_mask': attention_mask_i32
+        }
+
+        outputs = model(inputs=inputs, training=False, output_hidden_states=True)
+
+        result = {
+            'dense_vecs': outputs['dense_vecs'],
+            'colbert_vecs': outputs['colbert_vecs'],
+            'last_hidden_state': outputs['last_hidden_state'],
+        }
+
+        if outputs.get('hidden_states') is not None:
+            hidden_states = tf.stack(outputs['hidden_states'], axis=0)
+            result['hidden_states'] = hidden_states
+
+        return result
+
+    # Get concrete function and freeze variables into constants
+    concrete = serving_fn.get_concrete_function()
+    frozen = convert_variables_to_constants_v2(concrete, lower_control_flow=False)
+
+    # Save a minimalist module with frozen signature
+    root = tf.Module()
+    tf.saved_model.save(
+        root,
+        model_save_path,
+        signatures={'serving_default': frozen}
+    )
+
+    # Save tokenizer alongside
     tokenizer.save_pretrained(save_path)
 
     return model_save_path

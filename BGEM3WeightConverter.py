@@ -1,4 +1,4 @@
-from BGEM3TFModel import BGEM3TensorFlow, save_model_with_tokenizer
+from BGEM3TFModel import BGEM3TensorFlow, save_model_with_tokenizer, save_model_with_tokenizer_frozen
 from huggingface_hub import hf_hub_download
 
 from transformers import AutoModel
@@ -241,6 +241,22 @@ def convert_and_save_model(model_name: str, save_path: str):
     # Save model
     tokenizer = tf_model.tokenizer
     save_model_with_tokenizer(tf_model, tokenizer, save_path)
+
+    return tf_model
+
+
+def convert_and_save_model_frozen(model_name: str, save_path: str):
+    """Convert PyTorch model to TensorFlow and save a FROZEN SavedModel (no variables)."""
+    # Initialize TensorFlow model
+    tf_model = BGEM3TensorFlow(model_name)
+
+    # Convert weights
+    converter = BGEM3WeightConverter(model_name)
+    tf_model = converter.initialize_weights(tf_model)
+
+    # Save frozen model
+    tokenizer = tf_model.tokenizer
+    save_model_with_tokenizer_frozen(tf_model, tokenizer, save_path)
 
     return tf_model
 
