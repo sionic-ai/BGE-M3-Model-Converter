@@ -1,4 +1,4 @@
-from BGEM3TFModel import BGEM3TensorFlow, save_model_with_tokenizer, save_model_with_tokenizer_frozen
+from BGEM3TFModel import BGEM3TensorFlow, save_model_with_tokenizer, save_model_with_tokenizer_frozen, save_model_oldstyle, save_model_oldstyle_module
 from huggingface_hub import hf_hub_download
 
 from transformers import AutoModel
@@ -257,6 +257,24 @@ def convert_and_save_model_frozen(model_name: str, save_path: str):
     # Save frozen model
     tokenizer = tf_model.tokenizer
     save_model_with_tokenizer_frozen(tf_model, tokenizer, save_path)
+
+    return tf_model
+
+
+def convert_and_save_model_oldstyle(model_name: str, save_path: str):
+    """Convert PyTorch model to TensorFlow and save a TF-only old-style SavedModel.
+
+    - Signature: inputs int64, outputs only 'last_hidden_state'
+    - No ONNX involved; variables remain ResourceVariables
+    - Model name sanitized to 'bge_m3_tensorflow' via BGEM3TFModel
+    """
+    tf_model = BGEM3TensorFlow(model_name)
+    converter = BGEM3WeightConverter(model_name)
+    tf_model = converter.initialize_weights(tf_model)
+
+    tokenizer = tf_model.tokenizer
+    # Prefer module-style save to avoid signature retracing discrepancies in some runtimes
+    save_model_oldstyle_module(tf_model, tokenizer, save_path)
 
     return tf_model
 

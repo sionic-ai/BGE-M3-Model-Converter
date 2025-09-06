@@ -18,19 +18,30 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         self.d_model = d_model
         self.depth = d_model // num_heads  # 각 헤드의 차원 크기
 
-        # Query, Key, Value를 위한 Dense Layer
-        self.wq = tf.keras.layers.Dense(d_model)
-        self.wk = tf.keras.layers.Dense(d_model)
-        self.wv = tf.keras.layers.Dense(d_model)
+        # Query, Key, Value를 위한 Dense Layer (명시적 이름 부여)
+        self.wq = tf.keras.layers.Dense(d_model, name="attention_wq")
+        self.wk = tf.keras.layers.Dense(d_model, name="attention_wk")
+        self.wv = tf.keras.layers.Dense(d_model, name="attention_wv")
 
         # 출력 레이어
-        self.dense = tf.keras.layers.Dense(d_model)
+        self.dense = tf.keras.layers.Dense(d_model, name="attention_out")
 
         # 어텐션 layerNorm
         self.attlayerNorm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
 
         # 드롭아웃
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
+
+    def build(self, input_shape):
+        # input_shape: (batch, seq_len, d_model)
+        self.wq.build(input_shape)
+        self.wk.build(input_shape)
+        self.wv.build(input_shape)
+        self.dense.build(input_shape)
+        # LayerNorm needs to create gamma/beta for last dim
+        self.attlayerNorm.build(input_shape)
+        # Dropout has no variables; no build needed
+        super().build(input_shape)
 
     def stable_softmax(self, logits, axis=None, name=None):
         """
@@ -92,7 +103,8 @@ class BGEM3TensorFlow(tf.keras.Model):
                  colbert_dim=-1, batch_size=256, query_max_length=512,
                  passage_max_length=512, return_dense=True, return_sparse=False,
                  return_colbert_vecs=False, dropout_rate=0.1):
-        super().__init__(name="bge-m3-tensorflow")
+        # Use an underscore-only name to avoid scope duplication issues in some runtimes
+        super().__init__(name="bge_m3_tensorflow")
 
         self.model_name = model_name
         self.normalize_embeddings = normalize_embeddings
@@ -193,7 +205,7 @@ class BGEM3TensorFlow(tf.keras.Model):
                 num_heads=self.num_heads,
                 intermediate_size=self.config.intermediate_size,
                 dropout_rate=self.dropout_rate,
-                name=f"encoder.layer.{i}"
+                name=f"encoder_layer_{i}"
             )
             self.encoder_layers.append(layer)
 
@@ -203,7 +215,7 @@ class BGEM3TensorFlow(tf.keras.Model):
             self.d_model,
             activation='tanh',
             kernel_initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
-            name="pooler.dense"
+            name="pooler_dense"
         )
 
     def _build_colbert(self):
@@ -310,18 +322,32 @@ class TransformerBlock(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads, intermediate_size, dropout_rate=0.1, **kwargs):
         super().__init__(**kwargs)
 
-        self.attention = MultiHeadAttention(d_model, num_heads, dropout_rate)
+        self.attention = MultiHeadAttention(d_model, num_heads, dropout_rate, name="multi_head_attention")
         self.attention_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
         self.attention_dropout = tf.keras.layers.Dropout(dropout_rate)
 
         # Intermediate -> gelu_approx
         self.intermediate = tf.keras.layers.Dense(
             intermediate_size,
-            name="intermediate.dense"
+            name="intermediate_dense"
         )
-        self.output_dense = tf.keras.layers.Dense(d_model, name="output.dense")
+        self.output_dense = tf.keras.layers.Dense(d_model, name="output_dense")
         self.output_dropout = tf.keras.layers.Dropout(dropout_rate)
         self.output_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+
+    def build(self, input_shape):
+        # input_shape: (batch, seq_len, d_model)
+        # Attention sublayer
+        self.attention.build(input_shape)
+        # Dense sublayers
+        self.intermediate.build(input_shape)
+        inter_units = self.intermediate.units
+        self.output_dense.build(tf.TensorShape([input_shape[0], input_shape[1], inter_units]))
+        # LayerNorms need to create gamma/beta for last dim
+        self.attention_norm.build(input_shape)
+        self.output_norm.build(input_shape)
+        # Dropouts have no variables; no build needed
+        super().build(input_shape)
 
     def gelu_approx(self, x):
         x = tf.convert_to_tensor(x)
@@ -405,6 +431,103 @@ def save_model_with_tokenizer(model, tokenizer, save_path):
     )
 
     # Save tokenizer
+    tokenizer.save_pretrained(save_path)
+
+    return model_save_path
+
+
+def save_model_oldstyle(model, tokenizer, save_path):
+    """Save a TF-only 'old-style' SavedModel:
+
+    - Inputs: int64 (input_ids, attention_mask) for TF-Java compatibility
+    - Outputs: only 'last_hidden_state' (float32 [B, T, H])
+    - Variables: kept as ResourceVariables (no ONNX, no freezing), but simplified signature
+    """
+    os.makedirs(save_path, exist_ok=True)
+    model_save_path = os.path.join(save_path, 'model')
+
+    # Ensure model is built
+    dummy_inputs = {
+        'input_ids': tf.zeros((2, 11), dtype=tf.int32),
+        'attention_mask': tf.ones((2, 11), dtype=tf.int32)
+    }
+    _ = model(dummy_inputs, training=False, output_hidden_states=True)
+
+    @tf.function(input_signature=[
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='input_ids'),
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='attention_mask')
+    ])
+    def serving_fn(input_ids, attention_mask):
+        # Cast to i32 internally
+        input_ids_i32 = tf.cast(input_ids, tf.int32)
+        attention_mask_i32 = tf.cast(attention_mask, tf.int32)
+
+        outputs = model(
+            inputs={'input_ids': input_ids_i32, 'attention_mask': attention_mask_i32},
+            training=False,
+            output_hidden_states=False
+        )
+        return {'last_hidden_state': outputs['last_hidden_state']}
+
+    # Bind concrete function explicitly to avoid retracing differences
+    concrete = serving_fn.get_concrete_function(
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='input_ids'),
+        tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='attention_mask')
+    )
+
+    # Optional: materialize once with tiny inputs to ensure stability
+    _ = concrete(tf.zeros([1, 4], tf.int64), tf.ones([1, 4], tf.int64))
+
+    tf.saved_model.save(model, model_save_path, signatures={'serving_default': concrete})
+
+    tokenizer.save_pretrained(save_path)
+
+    return model_save_path
+
+
+def save_model_oldstyle_module(model, tokenizer, save_path):
+    """Save using a tf.Module wrapper to bind the serving function on the root object.
+
+    This avoids potential retracing differences and ensures the saved root exposes exactly
+    the intended function with variables owned by a trackable submodule.
+    """
+    os.makedirs(save_path, exist_ok=True)
+    model_save_path = os.path.join(save_path, 'model')
+
+    # Ensure model is built
+    dummy_inputs = {
+        'input_ids': tf.zeros((2, 11), dtype=tf.int32),
+        'attention_mask': tf.ones((2, 11), dtype=tf.int32)
+    }
+    _ = model(dummy_inputs, training=False, output_hidden_states=False)
+
+    class Serving(tf.Module):
+        def __init__(self, mdl):
+            super().__init__()
+            # attach model as trackable
+            self.model = mdl
+
+        @tf.function(input_signature=[
+            tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='input_ids'),
+            tf.TensorSpec(shape=[None, None], dtype=tf.int64, name='attention_mask')
+        ])
+        def serving(self, input_ids, attention_mask):
+            # Cast to i32 internally
+            input_ids_i32 = tf.cast(input_ids, tf.int32)
+            attention_mask_i32 = tf.cast(attention_mask, tf.int32)
+            outputs = self.model(
+                inputs={'input_ids': input_ids_i32, 'attention_mask': attention_mask_i32},
+                training=False,
+                output_hidden_states=False
+            )
+            return {'last_hidden_state': outputs['last_hidden_state']}
+
+    sm = Serving(model)
+    # Warm-up the bound method
+    _ = sm.serving(tf.zeros([1, 4], tf.int64), tf.ones([1, 4], tf.int64))
+
+    tf.saved_model.save(sm, model_save_path, signatures={'serving_default': sm.serving})
+
     tokenizer.save_pretrained(save_path)
 
     return model_save_path

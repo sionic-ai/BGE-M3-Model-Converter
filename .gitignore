@@ -1,3 +1,7 @@
+converted_bge_m3
+gte_model/
+.DS_Store
+.idea
 model/
 *.zip
 __pycache__/

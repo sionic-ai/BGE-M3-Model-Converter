@@ -73,21 +73,16 @@ def show_all_layer_outputs_pytorch(all_layer_outputs, print_values=False):
     print()
 
 
-def load_converted_tf_model(saved_model_dir):
+def load_converted_tf_model(model_path, tokenizer_path):
     """
     TF SavedModel 디렉토리에서 모델을 로드하고,
     같은 경로에 있는 토크나이저를 함께 로드합니다.
-
-    - convert_and_save_model()나 save_model_with_tokenizer()로
-      "model" 폴더와 토크나이저 저장 가정.
     """
-    model_path = f"{saved_model_dir}/model"
     loaded_model = tf.saved_model.load(model_path)
     serving_fn = loaded_model.signatures["serving_default"]
 
-    tokenizer = AutoTokenizer.from_pretrained(saved_model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     return serving_fn, tokenizer
-
 
 def encode_with_tf_model(serving_fn, tokenizer, queries, max_length=128):
     """
@@ -110,7 +105,6 @@ def encode_with_tf_model(serving_fn, tokenizer, queries, max_length=128):
 
     return embeddings
 
-
 def encode_with_tf_model_and_get_hidden_states(serving_fn, tokenizer, queries, max_length=128):
     """
     *주의*:
@@ -130,13 +124,19 @@ def encode_with_tf_model_and_get_hidden_states(serving_fn, tokenizer, queries, m
         attention_mask=inputs["attention_mask"]
     )
 
-    hidden_states = outputs["hidden_states"]  # (num_layers, batch, seq_len, hidden_dim)
-    final_embeddings = outputs["dense_vecs"]
-    print("outputs['colbert_vecs'] : ")
-    print(outputs["colbert_vecs"])
+    print("Available keys in serving_fn output:", outputs.keys())
+
+    hidden_states = outputs.get("hidden_states")
+    final_embeddings = outputs.get("dense_vecs")
+    colbert_vecs = outputs.get("colbert_vecs")
+
+    if colbert_vecs is not None:
+        print("outputs['colbert_vecs'] : ")
+        print(colbert_vecs)
+    else:
+        print("'colbert_vecs' not found in serving_fn output.")
 
     return final_embeddings.numpy(), hidden_states
-
 
 def show_all_layer_outputs_tf(all_layer_outputs, print_values=False):
     """
@@ -144,6 +144,9 @@ def show_all_layer_outputs_tf(all_layer_outputs, print_values=False):
     (가정: all_layer_outputs가 (num_layers, batch, seq_len, hidden_dim) 형태)
     """
     print("\n[TensorFlow] All Layer Outputs:")
+    if all_layer_outputs is None:
+        print("No hidden states found.")
+        return
     for i, hs in enumerate(all_layer_outputs):
         print(f"  Layer {i} hidden state shape: {hs.shape}")
         if print_values:
@@ -151,7 +154,6 @@ def show_all_layer_outputs_tf(all_layer_outputs, print_values=False):
             sample_vals = hs[0, 0, :5].numpy()
             print(f"    Sample values (batch=0, token=0, dims=0~4): {sample_vals}")
     print()
-
 
 def cosine_similarity(a, b):
     """
@@ -163,10 +165,8 @@ def cosine_similarity(a, b):
     cos_sim = np.sum(a_norm * b_norm, axis=1)
     return cos_sim
 
-
 def mse(a, b):
     return np.mean((a - b) ** 2)
-
 
 def compare_layer_outputs(pt_all_layer_outputs, tf_all_layer_outputs):
    """
@@ -177,6 +177,10 @@ def compare_layer_outputs(pt_all_layer_outputs, tf_all_layer_outputs):
      (예: 0번이 embedding_output, 1번이 1번 레이어, ...)
    """
    print("\n=== Compare Layer Outputs (PyTorch vs TensorFlow) ===")
+
+   if tf_all_layer_outputs is None:
+       print("Cannot compare layer outputs because TensorFlow hidden states are not available.")
+       return
 
    num_pt_layers = len(pt_all_layer_outputs)
    num_tf_layers = tf_all_layer_outputs.shape[0]
@@ -226,6 +230,9 @@ def compare_layer_outputs1(pt_all_layer_outputs, tf_all_layer_outputs):
       (예: 0번이 embedding_output, 1번이 1번 레이어, ...)
     """
     print("\n=== Compare Layer Outputs (PyTorch vs TensorFlow) ===")
+    if tf_all_layer_outputs is None:
+        print("Cannot compare layer outputs because TensorFlow hidden states are not available.")
+        return
 
     # PyTorch: len(pt_all_layer_outputs) = num_layers_PyTorch
     # TensorFlow: tf_all_layer_outputs.shape[0] = num_layers_TF
@@ -262,7 +269,8 @@ def compare_layer_outputs1(pt_all_layer_outputs, tf_all_layer_outputs):
 def main():
     # 경로 설정 (예: ./bge-m3, ./converted_bge_m3)
     model_name_or_path = "BAAI/bge-m3"  # PyTorch 원본
-    saved_model_dir = "./converted_bge_m3"  # TF 변환본
+    tf_model_path = "./converted_bge_m3/model"  # TF 모델 경로
+    tf_tokenizer_path = "./converted_bge_m3"     # TF 토크나이저 경로
 
     queries = [
         "이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?",
@@ -282,14 +290,8 @@ def main():
     show_all_layer_outputs_pytorch(pt_all_layer_outputs, print_values=False)
 
     print("=== 2) TensorFlow 모델 로드 및 인코딩 ===")
-    tf_serving_fn, tf_tokenizer = load_converted_tf_model(saved_model_dir)
-    tf_embeddings = encode_with_tf_model(
-        tf_serving_fn,
-        tf_tokenizer,
-        queries,
-        max_length=128
-    )
-
+    tf_serving_fn, tf_tokenizer = load_converted_tf_model(tf_model_path, tf_tokenizer_path)
+    
     # (옵션) 레이어별 출력 노출 여부 확인
     try:
         tf_embeddings_with_layers, tf_all_layer_outputs = encode_with_tf_model_and_get_hidden_states(
@@ -304,10 +306,19 @@ def main():
         compare_layer_outputs(pt_all_layer_outputs, tf_all_layer_outputs)
 
         print("[TensorFlow] Final Embeddings Shape:", tf_embeddings_with_layers.shape)
-    except KeyError:
+    except KeyError as e:
+        print(f"An error occurred: {e}")
         print("TensorFlow 서빙 시그니처에 hidden_states가 없습니다. (기본 TF 변환본일 가능성)")
 
     print("\n=== 3) PT vs. TF 최종 임베딩 비교 ===")
+    
+    tf_embeddings = encode_with_tf_model(
+        tf_serving_fn,
+        tf_tokenizer,
+        queries,
+        max_length=128
+    )
+
 
     print(pt_embeddings)
     print(tf_embeddings)
