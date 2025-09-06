@@ -83,16 +83,64 @@ def load_converted_tf_model(saved_model_dir):
     """
     model_path = f"{saved_model_dir}/model"
     loaded_model = tf.saved_model.load(model_path)
-    serving_fn = loaded_model.signatures["serving_default"]
+    # Prefer a compatible signature if available
+    prefer = [
+        "serving_default",
+        "serving_int32_3in",
+        "serving_int64_3in",
+        "serving_int32_2in",
+        "serving_int64_2in",
+    ]
+    sigs = loaded_model.signatures
+    for k in prefer:
+        if k in sigs:
+            serving_fn = sigs[k]
+            break
+    else:
+        raise RuntimeError("No suitable serving signature found in SavedModel.")
 
     tokenizer = AutoTokenizer.from_pretrained(saved_model_dir)
     return serving_fn, tokenizer
 
 
+def call_signature(sig, input_ids, attention_mask, token_type_ids=None):
+    """
+    Call SavedModel signature with automatic key/dtype adaptation.
+    - Supplies only required keys
+    - Fills missing token_type_ids with zeros
+    - Casts inputs to signature dtypes
+    """
+    # structured_input_signature: (args, kwargs)
+    spec_kwargs = sig.structured_input_signature[1]
+
+    def prepare(name, value):
+        if name not in spec_kwargs:
+            return None
+        if value is None and name == "token_type_ids":
+            value = tf.zeros_like(input_ids)
+        want = spec_kwargs[name].dtype
+        if hasattr(value, "dtype") and value.dtype != want:
+            value = tf.cast(value, want)
+        return value
+
+    kwargs = {}
+    x = prepare("input_ids", input_ids)
+    if x is not None:
+        kwargs["input_ids"] = x
+    x = prepare("attention_mask", attention_mask)
+    if x is not None:
+        kwargs["attention_mask"] = x
+    x = prepare("token_type_ids", token_type_ids)
+    if x is not None:
+        kwargs["token_type_ids"] = x
+
+    return sig(**kwargs)
+
+
 def encode_with_tf_model(serving_fn, tokenizer, queries, max_length=128):
     """
     TensorFlow 모델(서빙 시그니처)로 임베딩 추출하는 함수.
-    BGEM3TensorFlow 구조상 "dense_vecs" 키에 최종 임베딩이 들어있다고 가정.
+    SavedModel은 last_hidden_state (B,T,H)만 반환하므로 CLS 풀링을 적용해 (B,H) 임베딩 생성.
     """
     inputs = tokenizer(
         queries,
@@ -102,11 +150,11 @@ def encode_with_tf_model(serving_fn, tokenizer, queries, max_length=128):
         return_tensors="tf"
     )
 
-    outputs = serving_fn(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"]
-    )
-    embeddings = outputs["dense_vecs"].numpy()  # (batch_size, hidden_size)
+    token_type_ids = inputs.get("token_type_ids", tf.zeros_like(inputs["input_ids"]))
+    outputs = call_signature(serving_fn, inputs["input_ids"], inputs["attention_mask"], token_type_ids)
+    # Serving returns last_hidden_state (B, T, H); apply CLS pooling for embedding
+    last_hidden = outputs["last_hidden_state"]  # (B, T, H)
+    embeddings = last_hidden[:, 0, :].numpy()  # (B, H)
 
     return embeddings
 
@@ -125,15 +173,17 @@ def encode_with_tf_model_and_get_hidden_states(serving_fn, tokenizer, queries, m
         return_tensors="tf"
     )
 
-    outputs = serving_fn(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"]
-    )
+    token_type_ids = inputs.get("token_type_ids", tf.zeros_like(inputs["input_ids"]))
+    outputs = call_signature(serving_fn, inputs["input_ids"], inputs["attention_mask"], token_type_ids)
 
-    hidden_states = outputs["hidden_states"]  # (num_layers, batch, seq_len, hidden_dim)
-    final_embeddings = outputs["dense_vecs"]
-    print("outputs['colbert_vecs'] : ")
-    print(outputs["colbert_vecs"])
+    # Only last_hidden_state is returned in serving; keep KeyError behavior for old path
+    hidden_states = outputs["hidden_states"]  # will raise KeyError (by design)
+    final_embeddings = outputs["last_hidden_state"]
+    if "colbert_vecs" in outputs:
+        print("outputs['colbert_vecs'] : ")
+        print(outputs["colbert_vecs"])
+    else:
+        print("colbert_vecs not returned by TF model (flag disabled).")
 
     return final_embeddings.numpy(), hidden_states
 

@@ -18,25 +18,27 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         self.d_model = d_model
         self.depth = d_model // num_heads  # 각 헤드의 차원 크기
 
-        # Query, Key, Value를 위한 Dense Layer
-        self.wq = tf.keras.layers.Dense(d_model)
-        self.wk = tf.keras.layers.Dense(d_model)
-        self.wv = tf.keras.layers.Dense(d_model)
+        # Query, Key, Value를 위한 Dense Layer (stable names for SavedModel)
+        self.wq = tf.keras.layers.Dense(d_model, name="attention_wq")
+        self.wk = tf.keras.layers.Dense(d_model, name="attention_wk")
+        self.wv = tf.keras.layers.Dense(d_model, name="attention_wv")
 
         # 출력 레이어
-        self.dense = tf.keras.layers.Dense(d_model)
+        self.dense = tf.keras.layers.Dense(d_model, name="attention_output")
 
         # 어텐션 layerNorm
-        self.attlayerNorm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.attlayerNorm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="attn_LayerNorm")
 
         # 드롭아웃
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
-    def stable_softmax(self, logits, axis=None, name=None):
-        """
-        Stable softmax implementation
-        """
-        return tf.nn.softmax(logits=logits + 1e-9, axis=axis, name=name)
+    def stable_softmax(self, logits, axis=-1, name=None):
+        """Numerically stable softmax: subtract max and compute in float32."""
+        dtype = logits.dtype
+        x = tf.cast(logits, tf.float32)
+        x = x - tf.reduce_max(x, axis=axis, keepdims=True)
+        probs = tf.nn.softmax(x, axis=axis, name=name)
+        return tf.cast(probs, dtype)
 
     def split_heads(self, x, batch_size):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
@@ -45,27 +47,29 @@ class MultiHeadAttention(tf.keras.layers.Layer):
     def call(self, inputs, mask=None, training=False):
         batch_size = tf.shape(inputs)[0]
 
-        # Query, Key, Value를 계산
-        q = self.wq(inputs)  # (batch_size, seq_len, d_model)
-        k = self.wk(inputs)  # (batch_size, seq_len, d_model)
-        v = self.wv(inputs)  # (batch_size, seq_len, d_model)
+        # Projections
+        q = self.wq(inputs)
+        k = self.wk(inputs)
+        v = self.wv(inputs)
 
-        # 다중 헤드로 분리
-        q = self.split_heads(q, batch_size)  # (batch_size, num_heads, seq_len_q, depth)
-        k = self.split_heads(k, batch_size)  # (batch_size, num_heads, seq_len_k, depth)
-        v = self.split_heads(v, batch_size)  # (batch_size, num_heads, seq_len_v, depth)
+        # Split heads
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
 
-        # Scaled Dot-Product Attention
-        sqrt_att_head_size = math.sqrt(self.depth)
-
-        attention_scores = tf.matmul(q, k, transpose_b=True)  # (batch_size, num_heads, seq_len_q, seq_len_k)
-        dk = tf.cast(sqrt_att_head_size, tf.float32)
-        attention_scores = tf.divide(attention_scores, dk)
+        # Scaled dot-product attention (compute in float32 for stability)
+        q_f = tf.cast(q, tf.float32)
+        k_f = tf.cast(k, tf.float32)
+        attention_scores = tf.matmul(q_f, k_f, transpose_b=True)
+        scale = tf.sqrt(tf.cast(self.depth, tf.float32))
+        attention_scores = attention_scores / scale
 
         if mask is not None:
-            attention_scores = tf.add(attention_scores, mask)
+            attention_scores = attention_scores + tf.cast(mask, tf.float32)
 
         attention_probs = self.stable_softmax(attention_scores, axis=-1)
+        # Cast back to v dtype for matmul efficiency under mixed precision
+        attention_probs = tf.cast(attention_probs, v.dtype)
         attention_probs = self.dropout(attention_probs, training=training)
 
         # Attention result
@@ -92,7 +96,8 @@ class BGEM3TensorFlow(tf.keras.Model):
                  colbert_dim=-1, batch_size=256, query_max_length=512,
                  passage_max_length=512, return_dense=True, return_sparse=False,
                  return_colbert_vecs=False, dropout_rate=0.1):
-        super().__init__(name="bge-m3-tensorflow")
+        # Use safe model name (no hyphen or dot) to avoid TF resource container issues
+        super().__init__(name="bge_m3_tensorflow")
 
         self.model_name = model_name
         self.normalize_embeddings = normalize_embeddings
@@ -118,11 +123,23 @@ class BGEM3TensorFlow(tf.keras.Model):
         self.num_layers = self.config.num_hidden_layers
         self.vocab_size = self.config.vocab_size
 
+        # Optional mixed precision
+        if self.use_fp16:
+            from tensorflow.keras import mixed_precision
+            try:
+                mixed_precision.set_global_policy("mixed_float16")
+            except Exception:
+                pass
+
         # Build components
         self._build_embeddings()
         self._build_encoder_layers()
         self._build_pooler()
+        # Handle ColBERT dim parameter
+        self.colbert_dim = self.d_model if not colbert_dim or colbert_dim < 1 else int(colbert_dim)
         self._build_colbert()
+        # Sparse head (optional)
+        self.sparse_linear = tf.keras.layers.Dense(1, name="sparse_linear")
 
         # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -193,7 +210,7 @@ class BGEM3TensorFlow(tf.keras.Model):
                 num_heads=self.num_heads,
                 intermediate_size=self.config.intermediate_size,
                 dropout_rate=self.dropout_rate,
-                name=f"encoder.layer.{i}"
+                name=f"encoder_layer_{i}"
             )
             self.encoder_layers.append(layer)
 
@@ -203,13 +220,11 @@ class BGEM3TensorFlow(tf.keras.Model):
             self.d_model,
             activation='tanh',
             kernel_initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
-            name="pooler.dense"
+            name="pooler_dense"
         )
 
     def _build_colbert(self):
-        self.colbert_linear = tf.keras.layers.Dense(
-            units=self.d_model,
-        )
+        self.colbert_linear = tf.keras.layers.Dense(self.colbert_dim, name="colbert_linear")
 
     def call(self, inputs, training=False, output_hidden_states=False):
 
@@ -225,7 +240,7 @@ class BGEM3TensorFlow(tf.keras.Model):
         input_shape = self.shape_list(inputs_embeds)[:-1]
 
         if token_type_ids is None:
-            token_type_ids = tf.fill(dims=input_shape, value=0)
+            token_type_ids = tf.zeros_like(input_ids, dtype=tf.int32)
 
         if position_ids is None:
             if input_ids is not None:
@@ -248,18 +263,17 @@ class BGEM3TensorFlow(tf.keras.Model):
         if training:
             embedding_output = self.dropout(embedding_output, training=training)
 
+        # Ensure attention mask exists and is float32 for numerical stability
+        if attention_mask is None:
+            attention_mask = tf.ones_like(input_ids, dtype=tf.int32)
+
         attention_mask_origin = attention_mask
 
-        attention_mask_shape = self.shape_list(attention_mask)
-
-        extended_attention_mask = tf.reshape(
-            attention_mask, (attention_mask_shape[0], 1, 1, attention_mask_shape[1])
-        )
-
-        extended_attention_mask = tf.cast(extended_attention_mask, dtype=embedding_output.dtype)
-        one_cst = tf.constant(1.0, dtype=embedding_output.dtype)
-        ten_thousand_cst = tf.constant(-10000.0, dtype=embedding_output.dtype)
-        extended_attention_mask = tf.multiply(tf.subtract(one_cst, extended_attention_mask), ten_thousand_cst)
+        B = tf.shape(input_ids)[0]
+        L = tf.shape(input_ids)[1]
+        extended_attention_mask = tf.reshape(tf.cast(attention_mask, tf.float32), (B, 1, 1, L))
+        # Large negative for masked positions (kept in float32)
+        extended_attention_mask = (1.0 - extended_attention_mask) * (-1e9)
 
         attention_mask = extended_attention_mask
 
@@ -276,29 +290,31 @@ class BGEM3TensorFlow(tf.keras.Model):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
-        # Pooling
-        if self.pooling_method == "mean":
-            pooled_output = tf.reduce_mean(hidden_states, axis=1)
-        else:  # default: cls
-            pooled_output = hidden_states[:, 0, :]
-
-        # Apply pooler if return_dense is True
-        if self.return_dense:
-            pooled_output = pooled_output
-
-        # Normalize embeddings if specified
-        if self.normalize_embeddings:
-            pooled_output = tf.nn.l2_normalize(pooled_output, axis=-1)
+        # Final last_hidden_state (B, T, H) in float32 (no pooling here)
+        last_hidden_state = tf.cast(hidden_states, tf.float32)
 
         ## colbert_vecs
-        colbert_vecs = self.colbert_linear(hidden_states[:, 1:])
-        colbert_vecs = colbert_vecs * tf.cast(attention_mask_origin[:, 1:][:, :, None], dtype=tf.float32)
+        colbert_vecs = None
+        if self.return_colbert_vecs:
+            # Compute in the native dtype (e.g., float16 under mixed precision)
+            colbert_in = hidden_states[:, 1:]
+            colbert_out = self.colbert_linear(colbert_in)
+            # Match mask dtype to colbert_out to avoid dtype mismatch in multiplication
+            m = tf.cast(attention_mask_origin[:, 1:], colbert_out.dtype)[:, :, None]
+            colbert_out = colbert_out * m
+            # Return as float32 for serving stability
+            colbert_vecs = tf.cast(colbert_out, tf.float32)
 
         outputs = {
-            "dense_vecs": pooled_output,
-            "colbert_vecs": colbert_vecs,
-            "last_hidden_state": hidden_states
+            "last_hidden_state": last_hidden_state
         }
+
+        if colbert_vecs is not None:
+            outputs["colbert_vecs"] = colbert_vecs
+
+        if self.return_sparse:
+            token_weights = tf.nn.relu(self.sparse_linear(hidden_states))
+            outputs["token_weights"] = token_weights
 
         if output_hidden_states:
             outputs["hidden_states"] = all_hidden_states
@@ -311,17 +327,15 @@ class TransformerBlock(tf.keras.layers.Layer):
         super().__init__(**kwargs)
 
         self.attention = MultiHeadAttention(d_model, num_heads, dropout_rate)
-        self.attention_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
-        self.attention_dropout = tf.keras.layers.Dropout(dropout_rate)
 
         # Intermediate -> gelu_approx
         self.intermediate = tf.keras.layers.Dense(
             intermediate_size,
-            name="intermediate.dense"
+            name="intermediate_dense"
         )
-        self.output_dense = tf.keras.layers.Dense(d_model, name="output.dense")
+        self.output_dense = tf.keras.layers.Dense(d_model, name="output_dense")
         self.output_dropout = tf.keras.layers.Dropout(dropout_rate)
-        self.output_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.output_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="output_LayerNorm")
 
     def gelu_approx(self, x):
         x = tf.convert_to_tensor(x)
@@ -350,53 +364,57 @@ class TransformerBlock(tf.keras.layers.Layer):
         return output
 
 
-def save_model_with_tokenizer(model, tokenizer, save_path):
-    """Save both model and tokenizer"""
+def save_model_with_tokenizer(model: "BGEM3TensorFlow", tokenizer, save_path: str):
+    """Export SavedModel with a single clean default signature.
+
+    inputs : int64 (input_ids, attention_mask)
+    outputs: last_hidden_state (B,T,H,float32), optional colbert_vecs (B,T-1,H,float32)
+    """
     os.makedirs(save_path, exist_ok=True)
     model_save_path = os.path.join(save_path, 'model')
+    # Clean previous export to avoid stale graph/variable metadata
+    try:
+        import shutil
+        if os.path.exists(model_save_path):
+            shutil.rmtree(model_save_path)
+    except Exception:
+        pass
 
-    # Ensure model is built by calling it with dummy inputs
-    dummy_inputs = {
-        'input_ids': tf.zeros((2, 11), dtype=tf.int32),
-        'attention_mask': tf.ones((2, 11), dtype=tf.int32)
+    # Build variables once
+    dummy = {
+        'input_ids': tf.zeros((2, 8), dtype=tf.int32),
+        'attention_mask': tf.ones((2, 8), dtype=tf.int32),
+        'token_type_ids': tf.zeros((2, 8), dtype=tf.int32),
     }
-    _ = model(dummy_inputs, training=False, output_hidden_states=True)
+    _ = model(dummy, training=False, output_hidden_states=False)
 
-    # Define serving signature
     @tf.function(input_signature=[
-        tf.TensorSpec(shape=[None, None], dtype=tf.int32, name='input_ids'),
-        tf.TensorSpec(shape=[None, None], dtype=tf.int32, name='attention_mask')
+        tf.TensorSpec([None, None], tf.int64, name='input_ids'),
+        tf.TensorSpec([None, None], tf.int64, name='attention_mask'),
     ])
-    def serving_fn(input_ids, attention_mask):
+    def serving_default(input_ids, attention_mask):
+        # Cast to int32, synthesize token_type_ids
+        ii = tf.cast(input_ids, tf.int32)
+        am = tf.cast(attention_mask, tf.int32)
+        tt = tf.zeros_like(ii)
 
-        print(input_ids)
-        inputs = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask
+        outs = model({'input_ids': ii, 'attention_mask': am, 'token_type_ids': tt},
+                     training=False, output_hidden_states=False)
+
+        ret = {
+            'last_hidden_state': tf.cast(outs['last_hidden_state'], tf.float32)
         }
+        if 'colbert_vecs' in outs:
+            ret['colbert_vecs'] = tf.cast(outs['colbert_vecs'], tf.float32)
+        return ret
 
-        outputs = model(inputs=inputs, training=False, output_hidden_states=True)
-
-        if outputs.get('hidden_states'):
-            hidden_states = tf.stack(outputs['hidden_states'], axis=0)
-            return {
-                'dense_vecs': outputs['dense_vecs'],  # CLS Token
-                'colbert_vecs': outputs['colbert_vecs'],
-                'hidden_states': hidden_states  # (num_layers, batch, seq_len, hidden_dim)
-            }
-        else:
-            return {
-                'dense_vecs': outputs['dense_vecs'],
-            }
-
-    # Save model
+    # Save the Keras model itself with a single default signature
     tf.saved_model.save(
         model,
         model_save_path,
-        signatures={'serving_default': serving_fn}
+        signatures={'serving_default': serving_default}
     )
 
-    # Save tokenizer
     tokenizer.save_pretrained(save_path)
 
     return model_save_path

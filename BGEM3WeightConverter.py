@@ -16,7 +16,8 @@ def load_sparse_weights():
         raise FileNotFoundError(f"FileNotFoundError: {model_path}")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    return torch.load(model_path, map_location=device, weights_only=True)
+    # Avoid weights_only for broader PyTorch compatibility
+    return torch.load(model_path, map_location=device)
 
 
 def load_colbert_weights():
@@ -55,11 +56,58 @@ def _init_colbert_weights(tf_model):
     colbert = load_colbert_weights()
     colbert_weights = colbert['weight']
     colbert_bias = colbert['bias']
+    # Convert to numpy and report shape
+    w = colbert_weights.detach().cpu().numpy() if hasattr(colbert_weights, "detach") else np.array(colbert_weights)
+    b = colbert_bias.detach().cpu().numpy() if hasattr(colbert_bias, "detach") else np.array(colbert_bias)
 
-    tf_model.colbert_linear.set_weights([
-        colbert_weights.numpy().T,
-        colbert_bias.numpy()
-    ])
+    out_dim, in_dim = w.shape  # PT: (out_dim, in_dim)
+    print(f"ColBERT head weight shape: (out_dim={out_dim}, in_dim={in_dim})")
+
+    # Ensure the Dense layer has matching units and is built
+    try:
+        current_units = getattr(tf_model.colbert_linear, "units", None)
+    except Exception:
+        current_units = None
+
+    if current_units is not None and current_units != out_dim:
+        # Units mismatch; warn. Ideally create the model with detected colbert_dim to avoid this.
+        print(f"Warning: colbert_linear units ({current_units}) != detected out_dim ({out_dim}). We will attempt to set weights and may fail.")
+
+    # Ensure variables exist. If not built yet, do a dummy call to build with correct in_dim.
+    if not getattr(tf_model.colbert_linear, "built", False):
+        dummy = tf.zeros((1, 2, in_dim), dtype=tf.float32)
+        _ = tf_model.colbert_linear(dummy)
+
+    # Set weights (kernel shape: (in_dim, out_dim))
+    tf_model.colbert_linear.set_weights([w.T, b])
+
+
+def _init_sparse_weights(tf_model):
+    """Initialize sparse head weights if available (optional)."""
+    try:
+        st = load_sparse_weights()
+    except FileNotFoundError as e:
+        print(str(e))
+        return
+
+    # Expect PyTorch shape: (out_dim=1, in_dim=hidden)
+    w_pt = st["weight"]
+    b_pt = st["bias"]
+    # Ensure numpy
+    if hasattr(w_pt, "cpu"):
+        w_np = w_pt.cpu().numpy()
+    else:
+        w_np = np.array(w_pt)
+    if hasattr(b_pt, "cpu"):
+        b_np = b_pt.cpu().numpy()
+    else:
+        b_np = np.array(b_pt)
+
+    # Build layer if not built
+    in_dim = w_np.shape[1]
+    tf_model.sparse_linear.build((None, None, in_dim))
+    # Keras Dense kernel shape: (in_dim, out_dim)
+    tf_model.sparse_linear.set_weights([w_np.T, b_np])
 
 
 class BGEM3WeightConverter:
@@ -85,14 +133,14 @@ class BGEM3WeightConverter:
         # Initialize encoder layers
         self._init_transformer_blocks(tf_model)
 
-        # Initialize pooler
-        self._init_pooler_weights(tf_model)
-
-        # Initialize pooler
+        # Initialize pooler (once)
         self._init_pooler_weights(tf_model)
 
         # Initialize colbert
         _init_colbert_weights(tf_model)
+
+        # Initialize sparse head (optional)
+        _init_sparse_weights(tf_model)
 
         return tf_model
 
@@ -230,9 +278,28 @@ class BGEM3WeightConverter:
 
 
 def convert_and_save_model(model_name: str, save_path: str):
-    """Convert PyTorch model to TensorFlow and save"""
-    # Initialize TensorFlow model
-    tf_model = BGEM3TensorFlow(model_name)
+    """Convert PyTorch model to TensorFlow and save.
+    Also detects and uses original ColBERT dimension for TF head.
+    """
+    # Detect ColBERT original dimension from weights (out_dim)
+    try:
+        colbert = load_colbert_weights()
+        colbert_w = colbert['weight']
+        out_dim = int(colbert_w.shape[0])
+        print(f"Detected ColBERT dimension: {out_dim}")
+        colbert_dim = out_dim
+        return_colbert_vecs = True
+    except Exception as e:
+        print(f"ColBERT weights not found or failed to load: {e}")
+        colbert_dim = -1
+        return_colbert_vecs = False
+
+    # Initialize TensorFlow model with detected colbert_dim
+    tf_model = BGEM3TensorFlow(
+        model_name,
+        colbert_dim=colbert_dim,
+        return_colbert_vecs=return_colbert_vecs,
+    )
 
     # Convert weights
     converter = BGEM3WeightConverter(model_name)
