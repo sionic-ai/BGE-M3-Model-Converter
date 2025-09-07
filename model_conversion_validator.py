@@ -1,391 +1,168 @@
-import torch
+# model_conversion_validator.py
 import numpy as np
+import torch
 import tensorflow as tf
 from transformers import AutoTokenizer, AutoModel
 
+
 def load_original_pytorch_model(model_name_or_path):
-    """
-    원본 Hugging Face(PyTorch) 모델 및 토크나이저를 로드한 뒤,
-    (model, tokenizer)를 반환합니다.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-
-    model = AutoModel.from_pretrained(model_name_or_path)
-    model.eval()  # 평가 모드
-    return model, tokenizer
+    tok = AutoTokenizer.from_pretrained(model_name_or_path)
+    mdl = AutoModel.from_pretrained(model_name_or_path)
+    mdl.eval()
+    return mdl, tok
 
 
-def encode_with_pytorch_model(
-        model,
-        tokenizer,
-        queries,
-        max_length=128,
-        use_cls_pooling=True,
-        return_hidden_states=True
-):
-    """
-    PyTorch 모델로 임베딩 추출하는 함수.
-    use_cls_pooling=True이면 [CLS] 임베딩 반환,
-    False이면 Attention Mask 기반 mean pooling을 반환.
-    return_hidden_states=True 이면, 모든 레이어의 히든 스테이트도 반환.
-    """
-    inputs = tokenizer(
-        queries,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors='pt'
-    )
-
+def encode_with_pytorch_model(model, tokenizer, queries, max_length=128, use_cls_pooling=True):
+    inputs = tokenizer(queries, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     with torch.no_grad():
-        outputs = model(**inputs, output_hidden_states=return_hidden_states)
-        hidden_states = outputs.last_hidden_state  # (batch_size, seq_len, hidden_size)
-
+        outputs = model(**inputs, output_hidden_states=True)
+        hidden_states = outputs.last_hidden_state  # [B,T,H]
+        all_layer_outputs = outputs.hidden_states  # tuple(len=emb+24)
     if use_cls_pooling:
-        # [CLS] 벡터 사용
-        embeddings = hidden_states[:, 0, :]
+        emb = hidden_states[:, 0, :].cpu().numpy()
     else:
-        # Mean Pooling
-        attention_mask = inputs['attention_mask'].unsqueeze(-1).expand(hidden_states.size()).float()
-        sum_embeddings = torch.sum(hidden_states * attention_mask, dim=1)
-        sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
-        embeddings = sum_embeddings / sum_mask
+        attn = inputs["attention_mask"].unsqueeze(-1).expand(hidden_states.size()).float()
+        sum_embeddings = torch.sum(hidden_states * attn, dim=1)
+        sum_mask = torch.clamp(attn.sum(dim=1), min=1e-9)
+        emb = (sum_embeddings / sum_mask).cpu().numpy()
 
-    if return_hidden_states:
-        # outputs.hidden_states: 튜플 (embedding_layer_output + 각 Transformer 레이어 출력)
-        all_layer_outputs = outputs.hidden_states  # tuple of torch.Tensor
-        return embeddings.cpu().numpy(), all_layer_outputs
-    else:
-        return embeddings.cpu().numpy()
+
+    return emb, all_layer_outputs
 
 
 def show_all_layer_outputs_pytorch(all_layer_outputs, print_values=False):
-    """
-    PyTorch 레이어별 히든 스테이트의 shape 및 (옵션) 일부 실제 값을 출력하는 유틸 함수.
-    """
     print("\n[PyTorch] All Layer Outputs:")
     for i, hs in enumerate(all_layer_outputs):
-        print(f"  Layer {i} hidden state shape: {hs.shape}")
+        print(f"  Layer {i} hidden state shape: {tuple(hs.shape)}")
         if print_values:
-            # 첫 배치, 첫 토큰, 앞 5개 차원
-            sample_vals = hs[0, 0, :5]
-            print(f"    Sample values (batch=0, token=0, dims=0~4): {sample_vals.cpu().numpy()}")
-    print()
+            print("    sample:", hs[0, 0, :5].cpu().numpy())
 
 
-def load_converted_tf_model(saved_model_dir):
-    """
-    TF SavedModel 디렉토리에서 모델을 로드하고,
-    같은 경로에 있는 토크나이저를 함께 로드합니다.
-
-    - convert_and_save_model()나 save_model_with_tokenizer()로
-      "model" 폴더와 토크나이저 저장 가정.
-    """
-    model_path = f"{saved_model_dir}/model"
-    loaded_model = tf.saved_model.load(model_path)
-    # Prefer a compatible signature if available
-    prefer = [
-        "serving_default",
-        "serving_int32_3in",
-        "serving_int64_3in",
-        "serving_int32_2in",
-        "serving_int64_2in",
-    ]
-    sigs = loaded_model.signatures
-    for k in prefer:
-        if k in sigs:
-            serving_fn = sigs[k]
-            break
-    else:
-        raise RuntimeError("No suitable serving signature found in SavedModel.")
-
-    tokenizer = AutoTokenizer.from_pretrained(saved_model_dir)
-    return serving_fn, tokenizer
+def load_converted_tf_model(saved_root_dir: str):
+    model_dir = f"{saved_root_dir}/model"
+    loaded = tf.saved_model.load(model_dir)
+    sig = loaded.signatures["serving_default"]
+    tok = AutoTokenizer.from_pretrained(saved_root_dir)
+    return sig, tok
 
 
-def call_signature(sig, input_ids, attention_mask, token_type_ids=None):
-    """
-    Call SavedModel signature with automatic key/dtype adaptation.
-    - Supplies only required keys
-    - Fills missing token_type_ids with zeros
-    - Casts inputs to signature dtypes
-    """
-    # structured_input_signature: (args, kwargs)
-    spec_kwargs = sig.structured_input_signature[1]
-
-    def prepare(name, value):
-        if name not in spec_kwargs:
-            return None
-        if value is None and name == "token_type_ids":
-            value = tf.zeros_like(input_ids)
-        want = spec_kwargs[name].dtype
-        if hasattr(value, "dtype") and value.dtype != want:
-            value = tf.cast(value, want)
-        return value
-
-    kwargs = {}
-    x = prepare("input_ids", input_ids)
-    if x is not None:
-        kwargs["input_ids"] = x
-    x = prepare("attention_mask", attention_mask)
-    if x is not None:
-        kwargs["attention_mask"] = x
-    x = prepare("token_type_ids", token_type_ids)
-    if x is not None:
-        kwargs["token_type_ids"] = x
-
-    return sig(**kwargs)
+def call_signature(sig, input_ids, attention_mask):
+    # 강제 int32 캐스트
+    if input_ids.dtype != tf.int32:
+        input_ids = tf.cast(input_ids, tf.int32)
+    if attention_mask.dtype != tf.int32:
+        attention_mask = tf.cast(attention_mask, tf.int32)
+    return sig(input_ids=input_ids, attention_mask=attention_mask)
 
 
 def encode_with_tf_model(serving_fn, tokenizer, queries, max_length=128):
-    """
-    TensorFlow 모델(서빙 시그니처)로 임베딩 추출하는 함수.
-    SavedModel은 last_hidden_state (B,T,H)만 반환하므로 CLS 풀링을 적용해 (B,H) 임베딩 생성.
-    """
-    inputs = tokenizer(
-        queries,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="tf"
+    inputs_pt = tokenizer(queries, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+    inputs_tf = tokenizer(queries, padding=True, truncation=True, max_length=max_length, return_tensors="tf")
+
+    # 1) 입력 동일성 보장 (매우 중요)
+    assert np.array_equal(inputs_pt["input_ids"].numpy(), inputs_tf["input_ids"].numpy()), "PT/TF input_ids mismatch"
+    assert np.array_equal(inputs_pt["attention_mask"].numpy(), inputs_tf["attention_mask"].numpy()), "PT/TF mask mismatch"
+
+    outputs = serving_fn(
+        input_ids=tf.cast(inputs_tf["input_ids"], tf.int32),
+        attention_mask=tf.cast(inputs_tf["attention_mask"], tf.int32),
     )
-
-    token_type_ids = inputs.get("token_type_ids", tf.zeros_like(inputs["input_ids"]))
-    outputs = call_signature(serving_fn, inputs["input_ids"], inputs["attention_mask"], token_type_ids)
-    # Serving returns last_hidden_state (B, T, H); apply CLS pooling for embedding
-    last_hidden = outputs["last_hidden_state"]  # (B, T, H)
-    embeddings = last_hidden[:, 0, :].numpy()  # (B, H)
-
-    return embeddings
-
-
-def encode_with_tf_model_and_get_hidden_states(serving_fn, tokenizer, queries, max_length=128):
-    """
-    *주의*:
-    - TF SavedModel에서 레이어별 히든 스테이트도 반환한다고 가정할 때 사용 가능.
-    - 실제 변환된 모델이 'all_hidden_states'라는 키를 노출하지 않았다면 KeyError 발생 가능.
-    """
-    inputs = tokenizer(
-        queries,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="tf"
-    )
-
-    token_type_ids = inputs.get("token_type_ids", tf.zeros_like(inputs["input_ids"]))
-    outputs = call_signature(serving_fn, inputs["input_ids"], inputs["attention_mask"], token_type_ids)
-
-    # Only last_hidden_state is returned in serving; keep KeyError behavior for old path
-    hidden_states = outputs["hidden_states"]  # will raise KeyError (by design)
-    final_embeddings = outputs["last_hidden_state"]
-    if "colbert_vecs" in outputs:
-        print("outputs['colbert_vecs'] : ")
-        print(outputs["colbert_vecs"])
-    else:
-        print("colbert_vecs not returned by TF model (flag disabled).")
-
-    return final_embeddings.numpy(), hidden_states
-
-
-def show_all_layer_outputs_tf(all_layer_outputs, print_values=False):
-    """
-    TensorFlow 레이어별 히든 스테이트 shape와 (옵션) 일부 실제 값을 출력
-    (가정: all_layer_outputs가 (num_layers, batch, seq_len, hidden_dim) 형태)
-    """
-    print("\n[TensorFlow] All Layer Outputs:")
-    for i, hs in enumerate(all_layer_outputs):
-        print(f"  Layer {i} hidden state shape: {hs.shape}")
-        if print_values:
-            # 첫 배치, 첫 토큰, 앞 5개 차원
-            sample_vals = hs[0, 0, :5].numpy()
-            print(f"    Sample values (batch=0, token=0, dims=0~4): {sample_vals}")
-    print()
+    print(f'outputs >> {outputs}')
+    last_hidden = outputs["last_hidden_state"]    # [B,T,H]
+    emb = last_hidden[:, 0, :].numpy()
+    hiddens = outputs.get("hidden_states", None)  # (L+1,B,T,H)
+    print(f'hiddens, {hiddens}')
+    return emb, (hiddens.numpy() if hiddens is not None else None)
 
 
 def cosine_similarity(a, b):
-    """
-    (batch_size, hidden_dim) 형태 numpy 배열 a, b에 대해
-    벡터별 코사인 유사도(batch_size,) 반환
-    """
-    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-9)
-    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9)
-    cos_sim = np.sum(a_norm * b_norm, axis=1)
-    return cos_sim
+    a = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-9)
+    b = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-9)
+    return np.sum(a * b, axis=1)
 
 
 def mse(a, b):
     return np.mean((a - b) ** 2)
 
 
-def compare_layer_outputs(pt_all_layer_outputs, tf_all_layer_outputs):
-   """
-   PyTorch vs. TensorFlow 레이어별로 MSE, Cosine Similarity 등을 비교해주는 함수.
-   - pt_all_layer_outputs: tuple of torch.Tensor (길이: num_layers_PyTorch)
-     (예: [embedding_output, layer1_output, layer2_output, ...])
-   - tf_all_layer_outputs: tf.Tensor (shape: [num_layers_TF, batch_size, seq_len, hidden_dim])
-     (예: 0번이 embedding_output, 1번이 1번 레이어, ...)
-   """
-   print("\n=== Compare Layer Outputs (PyTorch vs TensorFlow) ===")
+def manual_l0_from_pt(sd, input_ids_np, attention_mask_np, padding_idx=1, eps=1e-5):
+    we = sd["embeddings.word_embeddings.weight"].cpu().numpy().astype(np.float32)
+    pe = sd["embeddings.position_embeddings.weight"].cpu().numpy().astype(np.float32)
+    te = sd["embeddings.token_type_embeddings.weight"].cpu().numpy().astype(np.float32)
+    gamma = sd["embeddings.LayerNorm.weight"].cpu().numpy().astype(np.float32)
+    beta  = sd["embeddings.LayerNorm.bias"].cpu().numpy().astype(np.float32)
 
-   num_pt_layers = len(pt_all_layer_outputs)
-   num_tf_layers = tf_all_layer_outputs.shape[0]
-   min_layers = min(num_pt_layers, num_tf_layers)
+    # HF와 동일: attention_mask로 포지션 ID 생성
+    mask = attention_mask_np.astype(np.int32)
+    pos_ids = np.cumsum(mask, axis=1) * mask + padding_idx
 
-
-   layer_names = {
-       0: "Embedding Layer",
-   }
-   for i in range(1, min_layers):
-       layer_names[i] = f"Encoder Layer {i}"
-
-   print("pt_all_layer_outputs", len(pt_all_layer_outputs))
-
-   print("tf_all_layer_outputs", len(tf_all_layer_outputs))
-
-   for layer_idx in range(min_layers):
-       pt_layer = pt_all_layer_outputs[layer_idx]  # shape: [batch, seq_len, hidden_dim]
-       tf_layer = tf_all_layer_outputs[layer_idx]  # shape: [batch, seq_len, hidden_dim]
-       tf_layer_np = tf_layer.numpy()
-
-       print(f"\n{layer_names[layer_idx]}:")
-       print(f"\n{layer_names[layer_idx]}:")
-       print(f"PyTorch shape: {pt_layer.shape}")
-       print(f"    dims: [batch_size={pt_layer.shape[0]}, seq_len={pt_layer.shape[1]}, hidden_dim={pt_layer.shape[2]}]")
-       print(f"TensorFlow shape: {tf_layer.shape}")
-       print(f"    dims: [batch_size={tf_layer.shape[0]}, seq_len={tf_layer.shape[1]}, hidden_dim={tf_layer.shape[2]}]")
-
-       layer_mse = mse(pt_layer.detach().cpu().numpy(), tf_layer_np)
-       pt_cls_vec = pt_layer[0, 0, :].detach().cpu().numpy()
-
-       tf_cls_vec = tf_layer_np[0, 0, :]
+    emb = we[input_ids_np] + pe[pos_ids] + te[0]  # type_vocab_size == 1
+    mean = emb.mean(axis=-1, keepdims=True)
+    var  = ((emb - mean) ** 2).mean(axis=-1, keepdims=True)  # 모집단 분산
+    xhat = (emb - mean) / np.sqrt(var + eps)
+    return xhat * gamma + beta  # (B,T,H)
 
 
-       cls_cos_sim = cosine_similarity(pt_cls_vec[np.newaxis, :], tf_cls_vec[np.newaxis, :])[0]
-
-       print(f"  -> MSE: {layer_mse:.6f}")
-       print(f"  -> CLS Token Cosine Similarity: {cls_cos_sim:.6f}")
-
-# ===================== 추가한 함수: 레이어별 출력 비교 =====================
-def compare_layer_outputs1(pt_all_layer_outputs, tf_all_layer_outputs):
-    """
-    PyTorch vs. TensorFlow 레이어별로 MSE, Cosine Similarity 등을 비교해주는 함수.
-    - pt_all_layer_outputs: tuple of torch.Tensor (길이: num_layers_PyTorch)
-      (예: [embedding_output, layer1_output, layer2_output, ...])
-    - tf_all_layer_outputs: tf.Tensor (shape: [num_layers_TF, batch_size, seq_len, hidden_dim])
-      (예: 0번이 embedding_output, 1번이 1번 레이어, ...)
-    """
-    print("\n=== Compare Layer Outputs (PyTorch vs TensorFlow) ===")
-
-    # PyTorch: len(pt_all_layer_outputs) = num_layers_PyTorch
-    # TensorFlow: tf_all_layer_outputs.shape[0] = num_layers_TF
-    num_pt_layers = len(pt_all_layer_outputs)
-    num_tf_layers = tf_all_layer_outputs.shape[0]
-
-    # 두 모델 간 레이어 개수가 다를 수 있으므로, 비교 가능한 만큼만 비교
-    min_layers = min(num_pt_layers, num_tf_layers)
-
-    for layer_idx in range(min_layers):
-        pt_layer = pt_all_layer_outputs[layer_idx]  # shape: [batch, seq_len, hidden_dim]
-        tf_layer = tf_all_layer_outputs[layer_idx]  # shape: [batch, seq_len, hidden_dim]
-        tf_layer_np = tf_layer.numpy()
-
-        # 일단 shape이 같은지 출력
-        print(f"Layer {layer_idx}: PT {pt_layer.shape} vs TF {tf_layer.shape}")
-
-        # MSE 계산
-        layer_mse = mse(pt_layer.detach().cpu().numpy(), tf_layer_np)
-        # Cosine Sim: 여기서는 batch*seq_len 개 각 토큰별 벡터의 평균 코사인 유사도 등
-        # 또는 첫 배치의 첫 토큰만 비교할 수도 있음
-        # 여기서는 간단히 "CLS 토큰(즉 0번 token)에 대한 cos sim" 등 비교 예시
-        pt_cls_vec = pt_layer[0, 0, :].detach().cpu().numpy()
-        tf_cls_vec = tf_layer_np[0, 0, :]
-
-        print(pt_layer)
-        print(tf_layer_np)
-        cls_cos_sim = cosine_similarity(pt_cls_vec[np.newaxis, :], tf_cls_vec[np.newaxis, :])[0]
-
-        print(f"  -> MSE: {layer_mse:.6f},  CLS CosSim: {cls_cos_sim:.6f}")
-    print()
 
 
 def main():
-    # 경로 설정 (예: ./bge-m3, ./converted_bge_m3)
-    model_name_or_path = "BAAI/bge-m3"  # PyTorch 원본
-    saved_model_dir = "./converted_bge_m3"  # TF 변환본
+    pt_id = "BAAI/bge-m3"
+    tf_dir = "./converted_bge_m3_tf1_java_fixed"
 
     queries = [
-        "이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?이 모델은 무엇을 하는 모델인가요?",
+        "이 모델은 무엇을 하는 모델인가요? 이 모델은 무엇을 하는 모델인가요?",
         "이 모델은 무엇을 하는 모델인가요?"
     ]
 
-    print("=== 1) PyTorch 모델 로드 및 인코딩 (레이어별 출력 포함) ===")
-    pt_model, pt_tokenizer = load_original_pytorch_model(model_name_or_path)
-    pt_embeddings, pt_all_layer_outputs = encode_with_pytorch_model(
-        pt_model,
-        pt_tokenizer,
-        queries,
-        max_length=128,
-        use_cls_pooling=True,
-        return_hidden_states=True
-    )
-    show_all_layer_outputs_pytorch(pt_all_layer_outputs, print_values=False)
+    print("=== 1) PyTorch ===")
+    pt_model, pt_tok = load_original_pytorch_model(pt_id)
+    pt_emb, pt_layers = encode_with_pytorch_model(pt_model, pt_tok, queries, max_length=128)
+    show_all_layer_outputs_pytorch(pt_layers)
 
-    print("=== 2) TensorFlow 모델 로드 및 인코딩 ===")
-    tf_serving_fn, tf_tokenizer = load_converted_tf_model(saved_model_dir)
-    tf_embeddings = encode_with_tf_model(
-        tf_serving_fn,
-        tf_tokenizer,
-        queries,
-        max_length=128
-    )
+    print("=== 2) TensorFlow ===")
+    tf_sig, tf_tok = load_converted_tf_model(tf_dir)
+    tf_emb, tf_layers = encode_with_tf_model(tf_sig, tf_tok, queries, max_length=128)
 
-    # (옵션) 레이어별 출력 노출 여부 확인
-    try:
-        tf_embeddings_with_layers, tf_all_layer_outputs = encode_with_tf_model_and_get_hidden_states(
-            tf_serving_fn,
-            tf_tokenizer,
-            queries,
-            max_length=128
-        )
-        show_all_layer_outputs_tf(tf_all_layer_outputs, print_values=False)
+    pt_l0 = pt_layers[0].detach().cpu().numpy()  # (B,T,H)
+    tf_l0 = tf_layers[0]  # (B,T,H)
+    print("L0 CLS head(PT)[:8]:", pt_l0[0, 0, :8])
+    print("L0 CLS head(TF)[:8]:", tf_l0[0, 0, :8])
 
-        # [추가] 레이어별로 직접 비교
-        compare_layer_outputs(pt_all_layer_outputs, tf_all_layer_outputs)
+    print("\n=== 3) Compare ===")
+    print("PT shape:", pt_emb.shape, "TF shape:", tf_emb.shape)
+    cs = cosine_similarity(pt_emb, tf_emb)
+    print("Cosine:", ["%.4f" % c for c in cs])
+    print("MSE:", float(mse(pt_emb, tf_emb)))
 
-        print("[TensorFlow] Final Embeddings Shape:", tf_embeddings_with_layers.shape)
-    except KeyError:
-        print("TensorFlow 서빙 시그니처에 hidden_states가 없습니다. (기본 TF 변환본일 가능성)")
+    # 선택: 레이어별 비교 (있을 때만)
+    print(f'tf_layers, {tf_layers}')
+    if tf_layers is not None:
+        print("\n[Layer-wise] Cosine (PT vs TF):")
+        # pt_layers: tuple(len=L+1), tf_layers: (L+1,B,T,H)
+        tf_layers_np = tf_layers  # (L+1,B,T,H)
+        for i in range(len(pt_layers)):
+            pt_l = pt_layers[i].detach().cpu().numpy()
+            tf_l = tf_layers_np[i]
+            c = cosine_similarity(pt_l[:, 0, :], tf_l[:, 0, :])  # CLS만 비교
+            e = mse(pt_l, tf_l)
+            print(f"  Layer {i:02d}  cos={c.mean():.4f}  mse={e:.6f}")
 
-    print("\n=== 3) PT vs. TF 최종 임베딩 비교 ===")
+    from transformers import AutoModel
+    pt_model = AutoModel.from_pretrained("BAAI/bge-m3")
+    sd = pt_model.state_dict()
+    inputs_pt = pt_tok(queries, padding=True, truncation=True, max_length=128, return_tensors="pt")
 
-    print(pt_embeddings)
-    print(tf_embeddings)
+    l0_manual = manual_l0_from_pt(sd,
+                                  inputs_pt["input_ids"].numpy(),
+                                  inputs_pt["attention_mask"].numpy(),
+                                  padding_idx=1,
+                                  eps=float(pt_model.config.layer_norm_eps))
 
-    cos_sims = cosine_similarity(pt_embeddings, tf_embeddings)
+    pt_l0 = pt_layers[0].detach().cpu().numpy()
+    tf_l0 = tf_layers[0]
 
-    errors = (pt_embeddings - tf_embeddings)
-    mse_val = mse(pt_embeddings, tf_embeddings)
-
-    print("===== Queries =====")
-    for i, q in enumerate(queries):
-        print(f"[{i}] {q}")
-    print()
-
-    print("===== PyTorch Embeddings (shape) =====")
-    print(pt_embeddings.shape)
-    print("===== TF Embeddings (shape) =====")
-    print(tf_embeddings.shape)
-
-    print("\n===== Pairwise Cosine Similarity (PT vs TF) =====")
-    for i, cs in enumerate(cos_sims):
-        print(f"Query {i} Cosine Similarity: {cs:.4f}")
-
-    print(f"\n===== MSE (PT vs TF) =====")
-    print(f"MSE: {mse_val:.6f}")
-
-    print("\n===== Sample Differences (first query, first 5 dims) =====")
-    print(errors[0][:5])
+    print("Manual vs PT  MSE:", np.mean((l0_manual - pt_l0) ** 2))
+    print("Manual vs TF  MSE:", np.mean((l0_manual - tf_l0) ** 2))
 
 
 if __name__ == "__main__":

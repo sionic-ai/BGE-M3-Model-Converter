@@ -43,7 +43,7 @@ def call_signature(sig, input_ids, attention_mask, token_type_ids=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Load TF ColBERT SavedModel and print output shapes.")
-    parser.add_argument("--model_dir", default="./converted_bge_m3", help="Path to SavedModel root (contains tokenizer files).")
+    parser.add_argument("--model_dir", default="./converted_bge_m3_tf1_java", help="Path to SavedModel root (contains tokenizer files).")
     parser.add_argument("--max_length", type=int, default=128, help="Tokenization max length.")
     parser.add_argument("--texts", nargs="*", default=[
         "이 모델은 무엇을 하는 모델인가요?",
