@@ -4,7 +4,8 @@ import numpy as np
 import torch
 import tensorflow as tf
 from transformers import AutoTokenizer
-# from BGEM3TFModel_tfkeras2 import BGEM3TensorFlow
+from BGEM3TFModel_tfkeras2 import BGEM3TensorFlow
+from huggingface_hub import snapshot_download  # NEW
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
 
@@ -28,31 +29,70 @@ def load_state_dict(model_or_path: str) -> dict:
     print(f"[load] pytorch_model.bin: {pt}")
     return torch.load(pt, map_location="cpu")
 
-def load_colbert_weight(model_or_path: str):
-    try:
-        if os.path.isdir(model_or_path):
-            p = os.path.join(model_or_path, "colbert_linear.pt")
+def load_colbert_weight(model_name_or_path: str):
+    """
+    Hugging Face repo(또는 로컬 폴더)에서 colbert_linear.pt를 읽어 weight/bias를 numpy(float32)로 반환
+    weight: (out_dim, in_dim), bias: (out_dim,)
+    """
+    if os.path.isdir(model_name_or_path):
+        p = os.path.join(model_name_or_path, "colbert_linear.pt")
+    else:
+        local = snapshot_download(repo_id=model_name_or_path)
+        p = os.path.join(local, "colbert_linear.pt")
+
+    st = torch.load(p, map_location="cpu")
+    if isinstance(st, dict):
+        W = st.get("weight")
+        B = st.get("bias")
+        if W is None:  # 혹시 키 이름이 다르면 첫 텐서를 weight로 간주
+            first_key = next(iter(st))
+            W = st[first_key]
+            B = st.get("bias", None)
+    else:
+        # 리스트/튜플 또는 텐서
+        if isinstance(st, (list, tuple)):
+            W, B = st
         else:
-            from huggingface_hub import snapshot_download
-            local = snapshot_download(repo_id=model_or_path)
-            p = os.path.join(local, "colbert_linear.pt")
-        st = torch.load(p, map_location="cpu")
-        if isinstance(st, dict):
-            W = st.get("weight")
-            B = st.get("bias")
-            if W is None:
-                first_key = next(iter(st))
-                W = st[first_key]
-                B = st.get("bias", None)
-        else:
-            W, B = (st, None) if not isinstance(st, (list, tuple)) else st
-        W = _np(W)
-        B = _np(B) if B is not None else None
-        print(f"[colbert] head: out_dim={W.shape[0]}, in_dim={W.shape[1]}, bias={'yes' if B is not None else 'no'}")
-        return W, B
-    except Exception as e:
-        print(f"[colbert] not found ({e}); skipping)")
-        return None, None
+            W, B = st, None
+
+    W = W.detach().cpu().numpy().astype(np.float32)
+    B = (
+        B.detach().cpu().numpy().astype(np.float32)
+        if B is not None
+        else np.zeros((W.shape[0],), np.float32)
+    )
+    print(f"[colbert] head: out_dim={W.shape[0]}, in_dim={W.shape[1]}, bias={'yes' if B is not None else 'no'}")
+    return W, B
+
+
+def project_colbert_pt(
+    last_hidden_np: np.ndarray,
+    attention_mask_np: np.ndarray,
+    W: np.ndarray,
+    b: np.ndarray,
+) -> np.ndarray:
+    """
+    PT last_hidden_state로부터 ColBERT head 적용 결과를 계산
+    last_hidden_np: (B,T,H)  / attention_mask_np: (B,T)  / W: (O,H)  / b: (O,)
+    반환: masked colbert vecs, shape (B,T-1,O)
+    """
+    # 1) CLS 제외
+    x = last_hidden_np[:, 1:, :]  # (B, T-1, H)
+    # 2) 선형 사상: x @ W^T + b, einsum 'bth,oh->bto'
+    y = np.einsum('bth,oh->bto', x, W) + b[None, None, :]
+    # 3) 마스킹
+    submask = attention_mask_np[:, 1:].astype(np.float32)  # (B, T-1)
+    y = y * submask[:, :, None]
+    return y
+
+
+def cosine_rowwise(a: np.ndarray, b: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    """
+    마지막 축(특징 축) 기준 코사인 유사도. a,b: (...,D) -> (...)
+    """
+    a_n = a / (np.linalg.norm(a, axis=-1, keepdims=True) + eps)
+    b_n = b / (np.linalg.norm(b, axis=-1, keepdims=True) + eps)
+    return np.sum(a_n * b_n, axis=-1)
 
 def _to_tf_dtype(d) -> tf.dtypes.DType:
     try:

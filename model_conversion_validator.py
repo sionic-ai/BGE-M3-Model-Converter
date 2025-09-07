@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import tensorflow as tf
 from transformers import AutoTokenizer, AutoModel
+from huggingface_hub import snapshot_download
 
 
 def load_original_pytorch_model(model_name_or_path):
@@ -72,7 +73,8 @@ def encode_with_tf_model(serving_fn, tokenizer, queries, max_length=128):
     emb = last_hidden[:, 0, :].numpy()
     hiddens = outputs.get("hidden_states", None)  # (L+1,B,T,H)
     print(f'hiddens, {hiddens}')
-    return emb, (hiddens.numpy() if hiddens is not None else None)
+    colbert = outputs.get("colbert_vecs", None)
+    return emb, (hiddens.numpy() if hiddens is not None else None), (colbert.numpy() if colbert is not None else None)
 
 
 def cosine_similarity(a, b):
@@ -103,6 +105,64 @@ def manual_l0_from_pt(sd, input_ids_np, attention_mask_np, padding_idx=1, eps=1e
     return xhat * gamma + beta  # (B,T,H)
 
 
+# === ColBERT helpers ===
+def load_colbert_weight(model_name_or_path: str):
+    """
+    Load colbert_linear.pt from local path or HF repo and return W, b as float32 numpy arrays.
+    W: (out_dim, in_dim), b: (out_dim,)
+    """
+    import os
+    if os.path.isdir(model_name_or_path):
+        p = os.path.join(model_name_or_path, "colbert_linear.pt")
+    else:
+        local = snapshot_download(repo_id=model_name_or_path)
+        p = os.path.join(local, "colbert_linear.pt")
+
+    st = torch.load(p, map_location="cpu")
+    if isinstance(st, dict):
+        W = st.get("weight")
+        B = st.get("bias")
+        if W is None:
+            first_key = next(iter(st))
+            W = st[first_key]
+            B = st.get("bias", None)
+    else:
+        if isinstance(st, (list, tuple)):
+            W, B = st
+        else:
+            W, B = st, None
+
+    W = W.detach().cpu().numpy().astype(np.float32)
+    B = (
+        B.detach().cpu().numpy().astype(np.float32)
+        if B is not None
+        else np.zeros((W.shape[0],), np.float32)
+    )
+    return W, B
+
+
+def project_colbert_pt(last_hidden_np: np.ndarray,
+                       attention_mask_np: np.ndarray,
+                       W: np.ndarray,
+                       b: np.ndarray) -> np.ndarray:
+    """
+    Apply ColBERT head on PT last_hidden_state and mask out padding.
+    last_hidden_np: (B,T,H), attention_mask_np: (B,T), W: (O,H), b: (O,) -> returns (B,T-1,O)
+    """
+    x = last_hidden_np[:, 1:, :]  # remove CLS
+    y = np.einsum('bth,oh->bto', x, W) + b[None, None, :]
+    submask = attention_mask_np[:, 1:].astype(np.float32)
+    y = y * submask[:, :, None]
+    return y
+
+
+def cosine_rowwise(a: np.ndarray, b: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    """Cosine similarity along the last dimension."""
+    a_n = a / (np.linalg.norm(a, axis=-1, keepdims=True) + eps)
+    b_n = b / (np.linalg.norm(b, axis=-1, keepdims=True) + eps)
+    return np.sum(a_n * b_n, axis=-1)
+
+
 
 
 def main():
@@ -121,7 +181,7 @@ def main():
 
     print("=== 2) TensorFlow ===")
     tf_sig, tf_tok = load_converted_tf_model(tf_dir)
-    tf_emb, tf_layers = encode_with_tf_model(tf_sig, tf_tok, queries, max_length=128)
+    tf_emb, tf_layers, tf_colbert = encode_with_tf_model(tf_sig, tf_tok, queries, max_length=128)
 
     pt_l0 = pt_layers[0].detach().cpu().numpy()  # (B,T,H)
     tf_l0 = tf_layers[0]  # (B,T,H)
@@ -163,6 +223,75 @@ def main():
 
     print("Manual vs PT  MSE:", np.mean((l0_manual - pt_l0) ** 2))
     print("Manual vs TF  MSE:", np.mean((l0_manual - tf_l0) ** 2))
+
+    # === 4) ColBERT head validation (masked) ===
+    try:
+        Wc, bc = load_colbert_weight(pt_id)
+        batch_pt = pt_tok(queries, padding=True, truncation=True, max_length=128, return_tensors="pt")
+        inputs_mask = batch_pt["attention_mask"].numpy().astype(np.int32)  # (B,T)
+
+        # PT 측 colbert 투영
+        pt_last_hidden_np = pt_layers[-1].detach().cpu().numpy()  # (B,T,H)
+        pt_colbert = project_colbert_pt(pt_last_hidden_np, inputs_mask, Wc, bc)  # (B,T-1,O)
+
+        if tf_colbert is None:
+            print("[ColBERT] TF colbert_vecs not present in signature; skipped")
+        else:
+            # 시간축 동기화 (이론상 T-1 동일)
+            min_T = min(pt_colbert.shape[1], tf_colbert.shape[1])
+            ptc = pt_colbert[:, :min_T, :]
+            tfc = tf_colbert[:, :min_T, :]
+
+            # 유효토큰 마스크 (CLS 제외)
+            valid_mask = (inputs_mask[:, 1:][:, :min_T] == 1)  # (B, min_T)
+            # 평탄화 후 유효토큰만 선택
+            pt_flat = ptc.reshape(-1, ptc.shape[-1])[valid_mask.reshape(-1)]
+            tf_flat = tfc.reshape(-1, tfc.shape[-1])[valid_mask.reshape(-1)]
+
+            # 영벡터 제거(정규화시 왜곡 방지)
+            keep = (np.linalg.norm(pt_flat, axis=1) > 1e-12) | (np.linalg.norm(tf_flat, axis=1) > 1e-12)
+            pt_flat = pt_flat[keep]
+            tf_flat = tf_flat[keep]
+
+            col_mse_valid = mse(pt_flat, tf_flat)
+            col_cos_valid = cosine_rowwise(pt_flat, tf_flat).mean()
+            print(f"\n[ColBERT(valid)] mse={col_mse_valid:.8f}  cos={col_cos_valid:.6f}")
+
+            # 참고: 모든 위치(패딩 포함) 지표도 함께 출력
+            col_mse_all = mse(ptc, tfc)
+            col_cos_all = cosine_rowwise(
+                ptc.reshape(-1, ptc.shape[-1]), tfc.reshape(-1, tfc.shape[-1])
+            ).mean()
+            print(f"[ColBERT(all-pos)] mse={col_mse_all:.8f}  cos={col_cos_all:.6f}")
+
+        # === 5) last_hidden_state (masked) 비교 ===
+        pt_last = pt_layers[-1].detach().cpu().numpy()  # (B,T,H)
+        tf_last = tf_layers[-1]                          # (B,T,H)
+        min_T2 = min(pt_last.shape[1], tf_last.shape[1])
+        pt_last = pt_last[:, :min_T2, :]
+        tf_last = tf_last[:, :min_T2, :]
+        valid_mask2 = (inputs_mask[:, :min_T2] == 1)
+        pt_flat2 = pt_last.reshape(-1, pt_last.shape[-1])[valid_mask2.reshape(-1)]
+        tf_flat2 = tf_last.reshape(-1, tf_last.shape[-1])[valid_mask2.reshape(-1)]
+        mse_last = mse(pt_flat2, tf_flat2)
+        cos_last = cosine_rowwise(pt_flat2, tf_flat2).mean()
+        print(f"[last_hidden(valid)] mse={mse_last:.8f}  cos={cos_last:.6f}")
+
+        # === 6) Determinism check ===
+        batch_tf = tf_tok(queries, padding=True, truncation=True, max_length=128, return_tensors="tf")
+        outs1 = tf_sig(
+            input_ids=tf.cast(batch_tf["input_ids"], tf.int32),
+            attention_mask=tf.cast(batch_tf["attention_mask"], tf.int32),
+        )
+        outs2 = tf_sig(
+            input_ids=tf.cast(batch_tf["input_ids"], tf.int32),
+            attention_mask=tf.cast(batch_tf["attention_mask"], tf.int32),
+        )
+        lh1 = outs1["last_hidden_state"].numpy()
+        lh2 = outs2["last_hidden_state"].numpy()
+        print("[determinism] max_abs_diff:", float(np.max(np.abs(lh1 - lh2))))
+    except Exception as e:
+        print(f"[ColBERT] skipped: {e}")
 
 
 if __name__ == "__main__":
